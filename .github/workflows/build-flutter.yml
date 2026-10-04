@@ -1,0 +1,201 @@
+name: Build Flutter / Android APK
+run-name: build ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL zip (info)"
+        required: false
+      tag:
+        description: "Tag release berisi ZIP project"
+        required: true
+      build_type:
+        description: "debug / release / release_genkey"
+        required: false
+        default: "release"
+      request_id:
+        description: "ID unik dari bot"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Default: runner GitHub (ubuntu-latest) -> langsung jalan tanpa setup server.
+    # Kalau pakai runner-pool sendiri: Settings > Secrets and variables > Actions > Variables,
+    # buat variable RUNNER_LABEL = samxdex
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      TAG: ${{ inputs.tag }}
+      BUILD_TYPE: ${{ inputs.build_type }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Download project ZIP
+        shell: bash
+        run: |
+          set -e
+          mkdir -p work
+          cd work
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern "*.zip" \
+            --dir .
+          ZIP_FILE=$(find . -maxdepth 1 -type f -name "*.zip" | head -1)
+          [ -n "$ZIP_FILE" ] || { echo "::error::ZIP project tidak ditemukan"; exit 1; }
+          unzip -q -o "$ZIP_FILE" -d src
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build
+        shell: bash
+        run: |
+          set -e
+          cd work/src
+
+          # Naikkan Gradle wrapper ke 8.14 HANYA kalau belum ada / versinya < 8.7
+          fix_wrapper() {
+            local dir="$1"
+            local f="$dir/gradle/wrapper/gradle-wrapper.properties"
+            local need=1
+            if [ -f "$f" ]; then
+              local cur
+              cur=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*' "$f" | head -1 | sed 's/^gradle-//')
+              if [ -n "$cur" ] && [ "$(printf '%s\n' 8.7 "$cur" | sort -V | head -1)" = "8.7" ]; then
+                need=0
+              fi
+            fi
+            if [ "$need" = "1" ]; then
+              mkdir -p "$dir/gradle/wrapper"
+              printf '%s\n' \
+                'distributionBase=GRADLE_USER_HOME' \
+                'distributionPath=wrapper/dists' \
+                'zipStoreBase=GRADLE_USER_HOME' \
+                'zipStorePath=wrapper/dists' \
+                'distributionUrl=https\://services.gradle.org/distributions/gradle-8.14-all.zip' \
+                > "$f"
+            fi
+          }
+
+          PUB=$(find . -name pubspec.yaml \
+            -not -path "*/.*" \
+            -not -path "*/node_modules/*" | head -1)
+
+          if [ -n "$PUB" ]; then
+            PROJECT_DIR="$(dirname "$PUB")"
+            cd "$PROJECT_DIR"
+
+            if [ ! -d android ]; then
+              flutter create . --platforms=android
+            fi
+
+            fix_wrapper android
+            flutter pub get
+
+            if [ "$BUILD_TYPE" = "debug" ]; then
+              flutter build apk --debug
+            else
+              flutter build apk --release
+            fi
+          else
+            GR=$(find . -name gradlew -not -path "*/.*" | head -1)
+            [ -n "$GR" ] || {
+              echo "::error::Bukan project Flutter/Android (pubspec.yaml / gradlew tidak ada)"
+              exit 1
+            }
+
+            PROJECT_DIR="$(dirname "$GR")"
+            cd "$PROJECT_DIR"
+            chmod +x gradlew
+            ./gradlew --version
+
+            if [ "$BUILD_TYPE" = "debug" ]; then
+              ./gradlew assembleDebug
+            else
+              ./gradlew assembleRelease
+            fi
+          fi
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -e
+          mkdir -p out
+          find work/src -type f -name "*.apk" -path "*outputs*" -exec cp {} out/ \;
+          ls -lah out
+          [ -n "$(find out -type f -name "*.apk" -print -quit)" ] || {
+            echo "::error::APK tidak ditemukan"
+            exit 1
+          }
+
+      - name: Sign APK (release / release_genkey)
+        if: env.BUILD_TYPE != 'debug'
+        shell: bash
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          BT=$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)
+          mkdir -p signing signed
+
+          if [ "$BUILD_TYPE" = "release_genkey" ]; then
+            ALIAS=samxdex
+            PASS=$(openssl rand -hex 10)
+          else
+            ALIAS=androiddebugkey
+            PASS=android
+          fi
+
+          keytool -genkeypair \
+            -keystore signing/release.jks \
+            -alias "$ALIAS" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass "$PASS" \
+            -keypass "$PASS" \
+            -dname "CN=SAMXDEX BUILD, O=SAMXDEX, C=ID"
+
+          for f in out/*.apk; do
+            NAME=$(basename "$f")
+            "$BT/zipalign" -p -f 4 "$f" "signed/$NAME"
+            "$BT/apksigner" sign \
+              --ks signing/release.jks \
+              --ks-key-alias "$ALIAS" \
+              --ks-pass "pass:$PASS" \
+              --key-pass "pass:$PASS" \
+              "signed/$NAME"
+            "$BT/apksigner" verify "signed/$NAME"
+          done
+
+          rm -f out/*.apk
+          cp signed/*.apk out/
+
+          printf 'Keystore : release.jks\nAlias    : %s\nStorePass: %s\nKeyPass  : %s\n' \
+            "$ALIAS" "$PASS" "$PASS" > signing/keystore-info.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-build
+          path: out/*.apk
+          retention-days: 1
+
+      - name: Upload signing key (hanya release_genkey)
+        if: env.BUILD_TYPE == 'release_genkey'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-key
+          path: |
+            signing/release.jks
+            signing/keystore-info.txt
+          retention-days: 1
