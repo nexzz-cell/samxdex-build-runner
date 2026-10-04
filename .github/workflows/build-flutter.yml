@@ -1,0 +1,151 @@
+name: Build Flutter / Android APK
+run-name: build ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL zip (informational)"
+        required: false
+      tag:
+        description: "Release tag containing project ZIP"
+        required: true
+      build_type:
+        description: "debug / release / release_genkey"
+        required: false
+        default: "release"
+      version_name:
+        description: "App version name (1.0 - 10.0)"
+        required: false
+        default: "1.0"
+      request_id:
+        description: "Unique bot request ID"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  AGP_VERSION: "8.11.1"
+  GRADLE_VERSION: "8.13"
+  JAVA_VERSION: "17"
+
+jobs:
+  build:
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      TAG: ${{ inputs.tag }}
+      BUILD_TYPE: ${{ inputs.build_type }}
+      VERSION_NAME: ${{ inputs.version_name }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Download project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          cd work
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern "*.zip" --dir .
+          ZIP_FILE="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          [ -n "$ZIP_FILE" ] || { echo "::error::ZIP project tidak ditemukan pada release $TAG"; exit 1; }
+          unzip -q -o "$ZIP_FILE" -d src
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Validate and normalize Android toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work/src
+          PUB="$(find . -type f -name pubspec.yaml -not -path '*/.*' -not -path '*/node_modules/*' -print -quit || true)"
+          if [ -n "$PUB" ]; then
+            PROJECT_DIR="$(dirname "$PUB")"
+          else
+            GR="$(find . -type f -name gradlew -not -path '*/.*' -print -quit || true)"
+            [ -n "$GR" ] || { echo "::error::Bukan project Flutter/Android (pubspec.yaml / gradlew tidak ada)"; exit 1; }
+            PROJECT_DIR="$(dirname "$GR")"
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          cd "$PROJECT_DIR"
+          if [ ! -d android ] && [ -f pubspec.yaml ]; then flutter create . --platforms=android; fi
+          python3 "$GITHUB_WORKSPACE/.github/scripts/normalize_android.py" "$PWD" "$VERSION_NAME"
+          chmod +x android/gradlew 2>/dev/null || true
+          echo "=== TOOLCHAIN ==="
+          flutter --version
+          java -version
+          (cd android && ./gradlew --version)
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter clean
+          flutter pub get
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find work/src -type f -name '*.apk' -path '*outputs*' -exec cp {} out/ \;
+          ls -lah out
+          find out -type f -name '*.apk' -print -quit | grep -q . || { echo "::error::APK tidak ditemukan"; exit 1; }
+
+      - name: Sign APK (release / release_genkey)
+        if: env.BUILD_TYPE != 'debug'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          BT="$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)"
+          mkdir -p signing signed
+          if [ "$BUILD_TYPE" = "release_genkey" ]; then
+            ALIAS=samxdex
+            PASS=$(openssl rand -hex 10)
+          else
+            ALIAS=androiddebugkey
+            PASS=android
+          fi
+          keytool -genkeypair -keystore signing/release.jks -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -storepass "$PASS" -keypass "$PASS" -dname "CN=SAMXDEX BUILD, O=SAMXDEX, C=ID"
+          for f in out/*.apk; do
+            NAME=$(basename "$f")
+            "$BT/zipalign" -p -f 4 "$f" "signed/$NAME"
+            "$BT/apksigner" sign --ks signing/release.jks --ks-key-alias "$ALIAS" --ks-pass "pass:$PASS" --key-pass "pass:$PASS" "signed/$NAME"
+            "$BT/apksigner" verify "signed/$NAME"
+          done
+          rm -f out/*.apk
+          cp signed/*.apk out/
+          printf 'Keystore : release.jks\nAlias    : %s\nStorePass: %s\nKeyPass  : %s\n' "$ALIAS" "$PASS" "$PASS" > signing/keystore-info.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-build
+          path: out/*.apk
+          retention-days: 1
+
+      - name: Upload signing key (only release_genkey)
+        if: env.BUILD_TYPE == 'release_genkey'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-key
+          path: |
+            signing/release.jks
+            signing/keystore-info.txt
+          retention-days: 1
