@@ -1,4 +1,4 @@
-name: Build Web to APK
+name: SAMXTIX - Build Web to APK
 run-name: build ${{ inputs.request_id }}
 
 on:
@@ -6,16 +6,18 @@ on:
     inputs:
       web_url: { description: "URL website", required: true }
       app_name: { description: "Nama aplikasi", required: true }
-      icon_url: { description: "URL icon (asset release)", required: true }
+      icon_url: { description: "URL icon", required: true }
       version_name: { description: "App version name (1.0 - 10.0)", required: false, default: "1.0" }
+      agp_version: { description: "Android Gradle Plugin 8.x", required: false, default: "8.1.1" }
+      gradle_version: { description: "Gradle 8.x (contoh 8.0 / 8.14.4)", required: false, default: "8.0" }
       request_id: { description: "ID unik dari bot", required: true }
 
 permissions:
   contents: read
 
 env:
-  AGP_VERSION: "8.11.1"
-  GRADLE_VERSION: "8.13"
+  AGP_VERSION: ${{ inputs.agp_version || '8.1.1' }}
+  GRADLE_VERSION: ${{ inputs.gradle_version || '8.0' }}
 
 jobs:
   build:
@@ -36,69 +38,45 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.13"
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Validate 8.x toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GRADLE_VERSION" =~ ^8\.[0-9]+(\.[0-9]+)?$ ]] || { echo "::error::GRADLE_VERSION harus 8.x"; exit 1; }
+          [[ "$AGP_VERSION" =~ ^8\.[0-9]+(\.[0-9]+)?$ ]] || { echo "::error::AGP_VERSION harus 8.x"; exit 1; }
+          python3 - <<'PY'
+          import re, os
+          v=os.environ.get('VERSION_NAME','1.0').strip()
+          if not re.fullmatch(r'(?:[1-9]|10)(?:\.0)?', v): raise SystemExit('VERSION_NAME harus 1.0 sampai 10.0')
+          PY
 
       - name: Generate WebView project
+        shell: bash
         run: |
+          set -euo pipefail
           python3 - <<'PY'
           import os, html, re
-          url = os.environ["WEB_URL"].strip()
-          name = os.environ["APP_NAME"].strip() or "App"
-          version = os.environ.get("VERSION_NAME", "1.0").strip()
-          if not re.fullmatch(r"(?:[1-9]|10)(?:\.0)?", version):
-              raise SystemExit("VERSION_NAME harus 1.0 sampai 10.0")
-          pkg = "com.samxdex.webapp"
-          root = "proj"
+          url = os.environ['WEB_URL'].strip()
+          name = os.environ['APP_NAME'].strip() or 'App'
+          version = os.environ.get('VERSION_NAME', '1.0').strip()
+          agp = os.environ.get('AGP_VERSION', '8.1.1')
+          gradle = os.environ.get('GRADLE_VERSION', '8.0')
+          pkg = 'com.samxtix.webapp'
+          root = 'proj'
           def w(path, text):
-              p = os.path.join(root, path); os.makedirs(os.path.dirname(p), exist_ok=True)
-              open(p, "w", encoding="utf-8").write(text)
-          def xml_name(s):
-              s = html.escape(s, quote=False).replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
-              return ("\\" + s) if s[:1] in ("@", "?") else s
-          w("settings.gradle", """pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
-          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
-          rootProject.name = "WebApp"
-          include ':app'
-          """.replace("          ", ""))
-          w("build.gradle", "plugins { id 'com.android.application' version '8.11.1' apply false }\n")
-          w("gradle.properties", "android.useAndroidX=true\nandroid.nonTransitiveRClass=true\norg.gradle.jvmargs=-Xmx2g\n")
-          w("gradle/wrapper/gradle-wrapper.properties", "distributionBase=GRADLE_USER_HOME\ndistributionPath=wrapper/dists\ndistributionUrl=https\\://services.gradle.org/distributions/gradle-8.13-bin.zip\nzipStoreBase=GRADLE_USER_HOME\nzipStorePath=wrapper/dists\n")
-          w("app/build.gradle", """plugins { id 'com.android.application' }
-          android {
-              namespace '%s'
-              compileSdk 36
-              defaultConfig { applicationId "%s"; minSdk 24; targetSdk 36; versionCode 1; versionName "%s" }
-              compileOptions { sourceCompatibility JavaVersion.VERSION_11; targetCompatibility JavaVersion.VERSION_11 }
-          }
-          dependencies {
-              implementation 'androidx.appcompat:appcompat:1.7.1'
-              implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
-          }
-          """.replace("          ", "") % (pkg, pkg, version))
-          w("app/src/main/AndroidManifest.xml", """<?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <uses-permission android:name="android.permission.INTERNET"/>
-              <application android:label="@string/app_name" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:usesCleartextTraffic="true" android:theme="@style/Theme.AppCompat.Light.NoActionBar">
-                  <activity android:name=".MainActivity" android:exported="true" android:configChanges="orientation|screenSize|keyboardHidden">
-                      <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
-                  </activity>
-              </application>
-          </manifest>
-          """.replace("          ", ""))
-          w("app/src/main/res/values/strings.xml", '<?xml version="1.0" encoding="utf-8"?>\n<resources><string name="app_name">%s</string></resources>\n' % xml_name(name))
-          jurl = url.replace("\\", "\\\\").replace('"', '\\"')
-          w("app/src/main/java/com/samxdex/webapp/MainActivity.java", """package com.samxdex.webapp;
-          import android.os.Bundle; import android.webkit.*; import android.content.Intent; import android.net.Uri;
-          import androidx.appcompat.app.AppCompatActivity; import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
-          public class MainActivity extends AppCompatActivity {
-              private WebView web; private SwipeRefreshLayout swipe;
-              @Override protected void onCreate(Bundle b) { super.onCreate(b); web=new WebView(this); swipe=new SwipeRefreshLayout(this); swipe.addView(web); setContentView(swipe);
-                  WebSettings s=web.getSettings(); s.setJavaScriptEnabled(true); s.setDomStorageEnabled(true); s.setMediaPlaybackRequiresUserGesture(false); web.setWebChromeClient(new WebChromeClient());
-                  web.setWebViewClient(new WebViewClient(){ @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r){String u=r.getUrl().toString(); if(u.startsWith("http")) return false; try{startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse(u)));}catch(Exception ignored){} return true;} @Override public void onPageFinished(WebView v,String u){swipe.setRefreshing(false);} });
-                  swipe.setOnRefreshListener(()->web.reload()); web.loadUrl("%s"); }
-              @Override public void onBackPressed(){if(web.canGoBack())web.goBack();else super.onBackPressed();}
-          }
-          """.replace("          ", "") % jurl)
+              p=os.path.join(root,path); os.makedirs(os.path.dirname(p),exist_ok=True); open(p,'w',encoding='utf-8').write(text)
+          s=html.escape(name, quote=False).replace('\\','\\\\').replace("'","\\'").replace('"','\\"')
+          w('settings.gradle', """pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\ndependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\nrootProject.name = 'WebApp'\ninclude ':app'\n""")
+          w('build.gradle', f"plugins {{ id 'com.android.application' version '{agp}' apply false }}\n")
+          w('gradle.properties', 'android.useAndroidX=true\nandroid.nonTransitiveRClass=true\norg.gradle.jvmargs=-Xmx2g\n')
+          w('gradle/wrapper/gradle-wrapper.properties', f"distributionBase=GRADLE_USER_HOME\ndistributionPath=wrapper/dists\ndistributionUrl=https\\://services.gradle.org/distributions/gradle-{gradle}-bin.zip\nzipStoreBase=GRADLE_USER_HOME\nzipStorePath=wrapper/dists\n")
+          w('app/build.gradle', f"""plugins {{ id 'com.android.application' }}\nandroid {{ namespace '{pkg}'; compileSdk 35; defaultConfig {{ applicationId '{pkg}'; minSdk 24; targetSdk 35; versionCode 1; versionName '{version}' }}; compileOptions {{ sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }} }}\ndependencies {{ implementation 'androidx.appcompat:appcompat:1.7.1'; implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0' }}\n""")
+          w('app/src/main/AndroidManifest.xml', """<?xml version='1.0' encoding='utf-8'?>\n<manifest xmlns:android='http://schemas.android.com/apk/res/android'><uses-permission android:name='android.permission.INTERNET'/><application android:label='@string/app_name' android:usesCleartextTraffic='true' android:theme='@style/Theme.AppCompat.Light.NoActionBar'><activity android:name='.MainActivity' android:exported='true'><intent-filter><action android:name='android.intent.action.MAIN'/><category android:name='android.intent.category.LAUNCHER'/></intent-filter></activity></application></manifest>\n""")
+          w('app/src/main/res/values/strings.xml', f"<?xml version='1.0' encoding='utf-8'?><resources><string name='app_name'>{s}</string></resources>\n")
+          jurl=url.replace('\\','\\\\').replace('"','\\"')
+          w('app/src/main/java/com/samxtix/webapp/MainActivity.java', f"""package com.samxtix.webapp;\nimport android.app.*; import android.os.*; import android.webkit.*;\npublic class MainActivity extends Activity {{ public void onCreate(Bundle b){{super.onCreate(b); WebView w=new WebView(this); w.getSettings().setJavaScriptEnabled(true); w.getSettings().setDomStorageEnabled(true); w.setWebViewClient(new WebViewClient()); setContentView(w); w.loadUrl(\"{jurl}\");}} }}\n""")
           PY
 
       - name: Icon
@@ -106,14 +84,12 @@ jobs:
         run: |
           set -euo pipefail
           CONV=$(command -v convert || command -v magick)
-          TAG=$(echo "$ICON_URL" | sed -E 's#.*/releases/download/([^/]+)/.*#\1#')
-          if gh release download "$TAG" --repo "${{ github.repository }}" --pattern "icon.png" --dir /tmp --clobber && "$CONV" "/tmp/icon.png[0]" -resize 512x512 /tmp/icon_ok.png; then :; else
-            "$CONV" -size 512x512 xc:'#1e88e5' /tmp/icon_ok.png
-          fi
+          if gh release list --repo "${{ github.repository }}" >/dev/null 2>&1; then :; fi
+          if [ -n "$ICON_URL" ] && curl -L --fail --max-time 30 "$ICON_URL" -o /tmp/icon.png; then "$CONV" /tmp/icon.png -resize 512x512 /tmp/icon_ok.png; else "$CONV" -size 512x512 xc:'#2f6fed' /tmp/icon_ok.png; fi
           for d in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do n=${d%%:*}; px=${d##*:}; mkdir -p proj/app/src/main/res/mipmap-$n; for f in ic_launcher ic_launcher_round; do "$CONV" /tmp/icon_ok.png -resize ${px}x${px} proj/app/src/main/res/mipmap-$n/$f.png; done; done
 
       - name: Create Gradle wrapper
-        run: cd proj && gradle wrapper --gradle-version 8.13 --distribution-type bin
+        run: cd proj && gradle wrapper --gradle-version "$GRADLE_VERSION" --distribution-type bin
 
       - name: Build APK
         run: cd proj && ./gradlew assembleDebug --no-daemon --stacktrace
@@ -123,7 +99,6 @@ jobs:
           set -euo pipefail
           mkdir -p out
           cp proj/app/build/outputs/apk/debug/*.apk out/
-          ls -la out
 
       - uses: actions/upload-artifact@v4
         with:
