@@ -1,11 +1,11 @@
-name: Build Flutter / Android APK
+name: SAMXTIX - Build Flutter / Android APK
 run-name: build ${{ inputs.request_id }}
 
 on:
   workflow_dispatch:
     inputs:
       zip_url:
-        description: "URL zip (informational)"
+        description: "URL ZIP (informational)"
         required: false
       tag:
         description: "Release tag containing project ZIP"
@@ -18,6 +18,14 @@ on:
         description: "App version name (1.0 - 10.0)"
         required: false
         default: "1.0"
+      agp_version:
+        description: "Android Gradle Plugin version, e.g. 8.1.1"
+        required: false
+        default: "8.1.1"
+      gradle_version:
+        description: "Gradle 8.x version, e.g. 8.0, 8.7, 8.14.4"
+        required: false
+        default: "8.0"
       request_id:
         description: "Unique bot request ID"
         required: true
@@ -26,9 +34,9 @@ permissions:
   contents: read
 
 env:
-  AGP_VERSION: "8.11.1"
-  GRADLE_VERSION: "8.13"
   JAVA_VERSION: "17"
+  AGP_VERSION: ${{ inputs.agp_version || '8.1.1' }}
+  GRADLE_VERSION: ${{ inputs.gradle_version || '8.0' }}
 
 jobs:
   build:
@@ -48,7 +56,7 @@ jobs:
           mkdir -p work
           cd work
           gh release download "$TAG" --repo "${{ github.repository }}" --pattern "*.zip" --dir .
-          ZIP_FILE="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          ZIP_FILE="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit || true)"
           [ -n "$ZIP_FILE" ] || { echo "::error::ZIP project tidak ditemukan pada release $TAG"; exit 1; }
           unzip -q -o "$ZIP_FILE" -d src
 
@@ -63,10 +71,12 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Validate and normalize Android toolchain
+      - name: Validate Android/Gradle 8.x toolchain
         shell: bash
         run: |
           set -euo pipefail
+          [[ "$GRADLE_VERSION" =~ ^8\.[0-9]+(\.[0-9]+)?$ ]] || { echo "::error::GRADLE_VERSION harus 8.x, contoh 8.0, 8.7 atau 8.14.4"; exit 1; }
+          [[ "$AGP_VERSION" =~ ^8\.[0-9]+(\.[0-9]+)?$ ]] || { echo "::error::AGP_VERSION harus 8.x, contoh 8.1.1"; exit 1; }
           cd work/src
           PUB="$(find . -type f -name pubspec.yaml -not -path '*/.*' -not -path '*/node_modules/*' -print -quit || true)"
           if [ -n "$PUB" ]; then
@@ -79,45 +89,43 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           cd "$PROJECT_DIR"
           if [ ! -d android ] && [ -f pubspec.yaml ]; then flutter create . --platforms=android; fi
-          # Script disematkan langsung (tidak butuh actions/checkout / file di repo)
           NORMALIZER="${RUNNER_TEMP:-/tmp}/normalize_android.py"
           cat > "$NORMALIZER" <<'PYEOF'
           #!/usr/bin/env python3
           from pathlib import Path
-          import re
-          import sys
-
-          AGP = "8.11.1"
-          GRADLE = "8.13"
-          VERSION_RE = re.compile(r"(?:[1-9]|10)(?:\.0)?")
+          import os, re, sys
 
           root = Path(sys.argv[1]).resolve()
           version = sys.argv[2] if len(sys.argv) > 2 else "1.0"
-          if not VERSION_RE.fullmatch(version):
+          agp = os.environ.get("AGP_VERSION", "8.1.1")
+          gradle = os.environ.get("GRADLE_VERSION", "8.0")
+          if not re.fullmatch(r"(?:[1-9]|10)(?:\.0)?", version):
               raise SystemExit("VERSION_NAME harus 1.0 sampai 10.0")
+          if not re.fullmatch(r"8\.\d+(?:\.\d+)?", agp):
+              raise SystemExit("AGP_VERSION harus 8.x")
+          if not re.fullmatch(r"8\.\d+(?:\.\d+)?", gradle):
+              raise SystemExit("GRADLE_VERSION harus 8.x")
 
           android = root / "android"
           if not android.is_dir():
-              raise SystemExit("Folder android tidak ditemukan setelah project preparation")
+              raise SystemExit("Folder android tidak ditemukan")
 
           for name in ("settings.gradle", "build.gradle"):
               p = android / name
-              if not p.exists():
-                  continue
+              if not p.exists(): continue
               s = p.read_text(encoding="utf-8")
-              s = re.sub(r"(id\s+[\"\']com\.android\.application[\"\']\s+version\s+[\"\'])[0-9.]+([\"\'])", rf"\g<1>{AGP}\2", s)
-              s = re.sub(r"(id\s+[\"\']com\.android\.library[\"\']\s+version\s+[\"\'])[0-9.]+([\"\'])", rf"\g<1>{AGP}\2", s)
-              s = re.sub(r"(com\.android\.tools\.build:gradle:)[0-9.]+", rf"\g<1>{AGP}", s)
+              s = re.sub(r"(id\s+[\"']com\.android\.application[\"']\s+version\s+[\"'])[0-9.]+([\"'])", rf"\g<1>{agp}\2", s)
+              s = re.sub(r"(id\s+[\"']com\.android\.library[\"']\s+version\s+[\"'])[0-9.]+([\"'])", rf"\g<1>{agp}\2", s)
+              s = re.sub(r"(com\.android\.tools\.build:gradle:)[0-9.]+", rf"\g<1>{agp}", s)
               p.write_text(s, encoding="utf-8")
 
           for name in ("settings.gradle.kts", "build.gradle.kts"):
               p = android / name
-              if not p.exists():
-                  continue
+              if not p.exists(): continue
               s = p.read_text(encoding="utf-8")
-              s = re.sub(r"(id\(\"com\.android\.application\"\)\s+version\s+\")[0-9.]+(\")", rf"\g<1>{AGP}\2", s)
-              s = re.sub(r"(id\(\"com\.android\.library\"\)\s+version\s+\")[0-9.]+(\")", rf"\g<1>{AGP}\2", s)
-              s = re.sub(r"(com\.android\.tools\.build:gradle:)[0-9.]+", rf"\g<1>{AGP}", s)
+              s = re.sub(r"(id\(\"com\.android\.application\"\)\s+version\s+\")[0-9.]+(\")", rf"\g<1>{agp}\2", s)
+              s = re.sub(r"(id\(\"com\.android\.library\"\)\s+version\s+\")[0-9.]+(\")", rf"\g<1>{agp}\2", s)
+              s = re.sub(r"(com\.android\.tools\.build:gradle:)[0-9.]+", rf"\g<1>{agp}", s)
               p.write_text(s, encoding="utf-8")
 
           wrapper = android / "gradle/wrapper/gradle-wrapper.properties"
@@ -125,25 +133,20 @@ jobs:
           wrapper.write_text(
               "distributionBase=GRADLE_USER_HOME\n"
               "distributionPath=wrapper/dists\n"
-              f"distributionUrl=https\\://services.gradle.org/distributions/gradle-{GRADLE}-bin.zip\n"
+              f"distributionUrl=https\\://services.gradle.org/distributions/gradle-{gradle}-bin.zip\n"
               "zipStoreBase=GRADLE_USER_HOME\n"
               "zipStorePath=wrapper/dists\n",
               encoding="utf-8",
           )
 
-          app = android / "app/build.gradle"
-          if app.exists():
-              s = app.read_text(encoding="utf-8")
-              s = re.sub(r'versionName\s+["\'][^"\']+["\']', f'versionName "{version}"', s, count=1)
-              app.write_text(s, encoding="utf-8")
-
-          appk = android / "app/build.gradle.kts"
-          if appk.exists():
-              s = appk.read_text(encoding="utf-8")
-              s = re.sub(r'versionName\s*=\s*["\'][^"\']+["\']', f'versionName = "{version}"', s, count=1)
-              appk.write_text(s, encoding="utf-8")
+          for name in ("android/app/build.gradle", "android/app/build.gradle.kts"):
+              p = root / name
+              if not p.exists(): continue
+              s = p.read_text(encoding="utf-8")
+              s = re.sub(r'versionName\s*[=:]\s*["\'][^"\']+["\']', f'versionName {"=" if p.suffix == ".kts" else ""} "{version}"', s, count=1)
+              p.write_text(s, encoding="utf-8")
           PYEOF
-          python3 "$NORMALIZER" "$PWD" "$VERSION_NAME" || { echo "::error::normalize_android gagal (cek versi/struktur android project)"; exit 1; }
+          python3 "$NORMALIZER" "$PWD" "$VERSION_NAME"
           chmod +x android/gradlew 2>/dev/null || true
           echo "=== TOOLCHAIN ==="
           flutter --version
@@ -157,11 +160,7 @@ jobs:
           cd "$PROJECT_DIR"
           flutter clean
           flutter pub get
-          if [ "$BUILD_TYPE" = "debug" ]; then
-            flutter build apk --debug
-          else
-            flutter build apk --release
-          fi
+          if [ "$BUILD_TYPE" = "debug" ]; then flutter build apk --debug; else flutter build apk --release; fi
 
       - name: Collect APK
         shell: bash
@@ -169,7 +168,6 @@ jobs:
           set -euo pipefail
           mkdir -p out
           find work/src -type f -name '*.apk' -path '*outputs*' -exec cp {} out/ \;
-          ls -lah out
           find out -type f -name '*.apk' -print -quit | grep -q . || { echo "::error::APK tidak ditemukan"; exit 1; }
 
       - name: Sign APK (release / release_genkey)
@@ -180,14 +178,8 @@ jobs:
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
           BT="$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)"
           mkdir -p signing signed
-          if [ "$BUILD_TYPE" = "release_genkey" ]; then
-            ALIAS=samxdex
-            PASS=$(openssl rand -hex 10)
-          else
-            ALIAS=androiddebugkey
-            PASS=android
-          fi
-          keytool -genkeypair -keystore signing/release.jks -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -storepass "$PASS" -keypass "$PASS" -dname "CN=SAMXDEX BUILD, O=SAMXDEX, C=ID"
+          if [ "$BUILD_TYPE" = "release_genkey" ]; then ALIAS=samxtix; PASS=$(openssl rand -hex 10); else ALIAS=androiddebugkey; PASS=android; fi
+          keytool -genkeypair -keystore signing/release.jks -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -storepass "$PASS" -keypass "$PASS" -dname "CN=SAMXTIX BOT, O=SAMXTIX, C=ID"
           for f in out/*.apk; do
             NAME=$(basename "$f")
             "$BT/zipalign" -p -f 4 "$f" "signed/$NAME"
